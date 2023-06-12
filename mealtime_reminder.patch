@@ -1,0 +1,470 @@
+Submodule Loop contains modified content
+diff --git a/Loop/Loop/Managers/Missed Meal Detection/MealDetectionManager.swift b/Loop/Loop/Managers/Missed Meal Detection/MealDetectionManager.swift
+index 0941f8bf..4e512f08 100644
+--- a/Loop/Loop/Managers/Missed Meal Detection/MealDetectionManager.swift	
++++ b/Loop/Loop/Managers/Missed Meal Detection/MealDetectionManager.swift	
+@@ -228,7 +228,7 @@ class MealDetectionManager {
+     // Internal for unit testing
+     func manageMealNotifications(for status: MissedMealStatus, pendingAutobolusUnits: Double? = nil, bolusDurationEstimator getBolusDuration: (Double) -> TimeInterval?) {
+         // We should remove expired notifications regardless of whether or not there was a meal
+-        NotificationManager.removeExpiredMealNotifications()
++        NotificationManager.removeExpiredMealNotifications(notificationCategory: LoopNotificationCategory.missedMeal)
+         
+         // Figure out if we should deliver a notification
+         let now = self.currentDate
+diff --git a/Loop/Loop/Managers/NotificationManager.swift b/Loop/Loop/Managers/NotificationManager.swift
+index 22540cdf..a3577493 100644
+--- a/Loop/Loop/Managers/NotificationManager.swift
++++ b/Loop/Loop/Managers/NotificationManager.swift
+@@ -254,17 +254,82 @@ extension NotificationManager {
+ 
+         UNUserNotificationCenter.current().add(request)
+     }
++    
++    static func handleMealtimeReminderNotificationScheduling(carbEntry: StoredCarbEntry) {
++//        self.removePendingMealtimeReminderNotification(carbEntryIdentifier: carbEntry.syncIdentifier ?? "")
++        
++        self.removeExpiredMealNotifications(notificationCategory: LoopNotificationCategory.mealtimeReminder)
++        
++        self.sendMealtimeReminderNotification(mealtime: carbEntry.startDate, carbEntryIdentifier: carbEntry.syncIdentifier!)
++        
++        // check if there is a scheduled notification for carbEntry.syncIdentifier scheduled
++        // if yes:
++        //      delete scheduled notification, then continue
++        // if no:
++        //      continue
++        // clean up expired notifications
++        // then: create meal notification
++    }
++    
++    static func removePendingMealtimeReminderNotification(carbEntryIdentifier: String) {
++        let notificationCenter = UNUserNotificationCenter.current()
++        var identifiersToRemove: [String] = []
++
++        notificationCenter.getPendingNotificationRequests { pendingNotifications in
++            for notification in pendingNotifications {
++                
++                guard
++//                    notification.identifier == "\(LoopNotificationCategory.mealtimeReminder)\(carbEntryIdentifier)",
++                    notification.identifier == LoopNotificationCategory.mealtimeReminder.rawValue,
++                    let scheduledCarbEntryIdentifier = notification.content.userInfo["carbEntryIdentifier"] as? String,
++                    scheduledCarbEntryIdentifier == carbEntryIdentifier
++                else {
++                    continue
++                }
++
++                identifiersToRemove.append(notification.identifier)
++            }
++            
++            notificationCenter.removePendingNotificationRequests(withIdentifiers: identifiersToRemove)
++        }
++    }
++    
++    private static func sendMealtimeReminderNotification(mealtime: Date, carbEntryIdentifier: String) {
++        let notification = UNMutableNotificationContent()
++        // Mealtime Reminder can expire 5 minutes after mealtime.
++        let expirationDate = mealtime.addingTimeInterval(.minutes(5))
++
++        notification.title = String(format: NSLocalizedString("Mealtime Reminder", comment: "Notification title for a scheduled mealtime reminder."))
++        notification.body = String(format: NSLocalizedString("It's time to eat now!", comment: "Notification description for a scheduled mealtime reminder."))
++        notification.sound = .default
++        
++        notification.userInfo = [
++            LoopNotificationUserInfoKey.carbEntryIdentifier.rawValue: carbEntryIdentifier,
++            LoopNotificationUserInfoKey.expirationDate.rawValue: expirationDate,
++        ]
++
++        let triggerAt = Calendar.current.dateComponents([.hour, .minute], from: mealtime)
++        let trigger = UNCalendarNotificationTrigger(dateMatching: triggerAt, repeats: false)
++
++        let request = UNNotificationRequest(
++            identifier: LoopNotificationCategory.mealtimeReminder.rawValue,
++            content: notification,
++            trigger: trigger
++        )
++
++        UNUserNotificationCenter.current().add(request)
++    }
+ 
+-    static func removeExpiredMealNotifications(now: Date = Date()) {
++    static func removeExpiredMealNotifications(now: Date = Date(), notificationCategory: LoopNotificationCategory) {
+         let notificationCenter = UNUserNotificationCenter.current()
+         var identifiersToRemove: [String] = []
+         
+-        notificationCenter.getDeliveredNotifications { notifications in            
++        notificationCenter.getDeliveredNotifications { notifications in
+             for notification in notifications {
+                 let request = notification.request
+                 
+                 guard
+-                    request.identifier == LoopNotificationCategory.missedMeal.rawValue,
++                    request.identifier == notificationCategory.rawValue,
+                     let expirationDate = request.content.userInfo[LoopNotificationUserInfoKey.expirationDate.rawValue] as? Date,
+                     expirationDate < now
+                 else {
+diff --git a/Loop/Loop/View Controllers/CarbAbsorptionViewController.swift b/Loop/Loop/View Controllers/CarbAbsorptionViewController.swift
+index c6d7502b..c5b5e4ac 100644
+--- a/Loop/Loop/View Controllers/CarbAbsorptionViewController.swift	
++++ b/Loop/Loop/View Controllers/CarbAbsorptionViewController.swift	
+@@ -450,11 +450,14 @@ final class CarbAbsorptionViewController: LoopChartsTableViewController, Identif
+     public override func tableView(_ tableView: UITableView, commit editingStyle: UITableViewCell.EditingStyle, forRowAt indexPath: IndexPath) {
+         if editingStyle == .delete {
+             let status = carbStatuses[indexPath.row]
++            
+             deviceManager.loopManager.deleteCarbEntry(status.entry) { (result) -> Void in
+                 DispatchQueue.main.async {
+                     switch result {
+                     case .success:
+                         self.isEditing = false
++                        // Deleted entry may have scheduled mealtime reminder notification; delete it
++                        NotificationManager.removePendingMealtimeReminderNotification(carbEntryIdentifier: status.entry.syncIdentifier!)
+                         break  // Notification will trigger update
+                     case .failure(let error):
+                         self.refreshContext.update(with: .carbs)
+diff --git a/Loop/Loop/View Controllers/CarbEntryViewController.swift b/Loop/Loop/View Controllers/CarbEntryViewController.swift
+index 31f65e00..500ff2f2 100644
+--- a/Loop/Loop/View Controllers/CarbEntryViewController.swift	
++++ b/Loop/Loop/View Controllers/CarbEntryViewController.swift	
+@@ -139,7 +139,21 @@ final class CarbEntryViewController: LoopChartsTableViewController, Identifiable
+             }
+         }
+     }
+-
++    
++    private var shouldDisplayMealtimeReminder = false {
++        didSet {
++            if shouldDisplayMealtimeReminder != oldValue {
++                self.displayMealtimeReminderRow(rowType: DetailsRow.mealtimeReminder, isAddingRow: shouldDisplayMealtimeReminder)
++            }
++        }
++    }
++    
++    private var hasPendingDateChange = false
++    
++    private var isMealtimeReminderEnabled = false
++    
++    private var isFutureMeal = false
++    
+     var updatedCarbEntry: NewCarbEntry? {
+         if  let lastEntryDate = lastEntryDate,
+             let quantity = quantity,
+@@ -190,9 +204,29 @@ final class CarbEntryViewController: LoopChartsTableViewController, Identifiable
+         tableView.estimatedRowHeight = 44
+         tableView.register(DateAndDurationTableViewCell.nib(), forCellReuseIdentifier: DateAndDurationTableViewCell.className)
+         tableView.register(DateAndDurationSteppableTableViewCell.nib(), forCellReuseIdentifier: DateAndDurationSteppableTableViewCell.className)
++        tableView.register(SwitchTableViewCell.self, forCellReuseIdentifier: SwitchTableViewCell.className)
+ 
+         if originalCarbEntry != nil {
+             title = NSLocalizedString("carb-entry-title-edit", value: "Edit Carb Entry", comment: "The title of the view controller to edit an existing carb entry")
++            
++            var hasPending = false
++            UNUserNotificationCenter.current().getPendingNotificationRequests { pendingNotifications in
++                for notification in pendingNotifications {
++                    
++                    guard
++                        notification.identifier == LoopNotificationCategory.mealtimeReminder.rawValue,
++                        let scheduledCarbEntryIdentifier = notification.content.userInfo["carbEntryIdentifier"] as? String,
++                        scheduledCarbEntryIdentifier == self.originalCarbEntry!.syncIdentifier!
++                    else {
++                        continue
++                    }
++                    
++                    self.isMealtimeReminderEnabled = true
++                    break;
++                }
++            }
++            
++            shouldDisplayMealtimeReminder = hasPending || originalCarbEntry!.startDate > Date()
+         } else {
+             title = NSLocalizedString("carb-entry-title-add", value: "Add Carb Entry", comment: "The title of the view controller to create a new carb entry")
+         }
+@@ -263,6 +297,25 @@ final class CarbEntryViewController: LoopChartsTableViewController, Identifiable
+         tableView.endUpdates()
+     }
+     
++    private func displayMealtimeReminderRow(rowType: DetailsRow, isAddingRow: Bool ) {
++        if UserDefaults.standard.mealtimeReminderNotificationsEnabled {
++            if hasPendingDateChange {
++                tableView.beginUpdates()
++                
++                let lastSectionIndex = tableView.numberOfSections - 1;
++                let lastRowIndex = tableView.numberOfRows(inSection: lastSectionIndex)
++                
++                if isAddingRow {
++                    tableView.insertRows(at: [IndexPath(row: lastRowIndex, section: lastSectionIndex)], with: UITableView.RowAnimation.automatic)
++                } else {
++                    tableView.deleteRows(at: [IndexPath(row: lastRowIndex-1, section: lastSectionIndex)], with: UITableView.RowAnimation.automatic)
++                }
++                
++                tableView.endUpdates()
++            }
++        }
++    }
++    
+     private func displayWarningRow(rowType: WarningRow, isAddingRow: Bool = true ) {
+         if shouldDisplayWarning {
+             tableView.beginUpdates()
+@@ -297,12 +350,16 @@ final class CarbEntryViewController: LoopChartsTableViewController, Identifiable
+             return displayWarningSection ? indexPath.section : indexPath.section + 1
+         }
+         
+-        static func numberOfRows(for section: Int, displayMissedMealWarning: Bool, displayOverrideWarning: Bool) -> Int {
++        static func numberOfRows(for section: Int, displayMissedMealWarning: Bool, displayOverrideWarning: Bool, displayMealtimeReminder: Bool) -> Int {
+             if section == Sections.warning.rawValue && (displayMissedMealWarning || displayOverrideWarning) {
+                 return displayMissedMealWarning && displayOverrideWarning ? WarningRow.allCases.count : WarningRow.allCases.count - 1
+             }
+ 
+-            return DetailsRow.allCases.count
++            if displayMealtimeReminder {
++                return DetailsRow.allCases.count
++            }
++            
++            return DetailsRow.allCases.count - 1
+         }
+         
+         static func footer(for section: Int, displayWarningSection: Bool) -> String? {
+@@ -331,6 +388,7 @@ final class CarbEntryViewController: LoopChartsTableViewController, Identifiable
+         case date
+         case foodType
+         case absorptionTime
++        case mealtimeReminder
+     }
+     
+     fileprivate enum WarningRow: Int, CaseIterable {
+@@ -343,7 +401,7 @@ final class CarbEntryViewController: LoopChartsTableViewController, Identifiable
+     }
+ 
+     override func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
+-        return Sections.numberOfRows(for: section, displayMissedMealWarning: shouldDisplayMissedMealWarning, displayOverrideWarning: shouldDisplayOverrideEnabledWarning)
++        return Sections.numberOfRows(for: section, displayMissedMealWarning: shouldDisplayMissedMealWarning, displayOverrideWarning: shouldDisplayOverrideEnabledWarning, displayMealtimeReminder: shouldDisplayMealtimeReminder)
+     }
+ 
+     override func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
+@@ -396,21 +454,21 @@ final class CarbEntryViewController: LoopChartsTableViewController, Identifiable
+                 return cell
+             case .date:
+                 let cell = tableView.dequeueReusableCell(withIdentifier: DateAndDurationSteppableTableViewCell.className) as! DateAndDurationSteppableTableViewCell
+-            
++                
+                 cell.titleLabel.text = NSLocalizedString("Time", comment: "Title of the carb entry date picker cell")
+                 cell.datePicker.isEnabled = isSampleEditable
+                 cell.datePicker.datePickerMode = .dateAndTime
+-                #if swift(>=5.2)
+-                    if #available(iOS 14.0, *) {
+-                        cell.datePicker.preferredDatePickerStyle = .wheels
+-                    }
+-                #endif
++#if swift(>=5.2)
++                if #available(iOS 14.0, *) {
++                    cell.datePicker.preferredDatePickerStyle = .wheels
++                }
++#endif
+                 cell.datePicker.maximumDate = date.addingTimeInterval(.hours(1))
+                 cell.datePicker.minimumDate = date.addingTimeInterval(.hours(-12))
+                 cell.datePicker.minuteInterval = 1
+                 cell.date = date
+                 cell.delegate = self
+-
++                
+                 return cell
+             case .foodType:
+                 if usesCustomFoodType {
+@@ -456,11 +514,28 @@ final class CarbEntryViewController: LoopChartsTableViewController, Identifiable
+                 cell.maximumDuration = maxAbsorptionTime
+                 cell.delegate = self
+                 
++                return cell
++            case .mealtimeReminder:
++                // TODO: edit existing meals necessary?
++                
++                let cell = tableView.dequeueReusableCell(withIdentifier: SwitchTableViewCell.className, for: indexPath) as! SwitchTableViewCell
++                cell.selectionStyle = .none
++                cell.textLabel?.text = NSLocalizedString("Meal Reminder", comment: "Text of the meal time reminder notification cell")
++                
++//                if originalCarbEntry != nil && NotificationManager.hasPendingMealtimeReminderNotification(carbEntry: originalCarbEntry!) {
++//                    isMealtimeReminderEnabled = true
++//                }
++                cell.switch?.isOn = isMealtimeReminderEnabled
++                cell.switch?.addTarget(self, action: #selector(mealtimeReminderChanged), for: .valueChanged)
+                 return cell
+             }
+         }
+     }
+-
++    
++    @objc private func mealtimeReminderChanged(_ sender: UISwitch) {
++        isMealtimeReminderEnabled = sender.isOn
++    }
++    
+     override func tableView(_ tableView: UITableView, willDisplay cell: UITableViewCell, forRowAt indexPath: IndexPath) {
+         switch Sections(rawValue: Sections.section(for: indexPath, displayWarningSection: shouldDisplayWarning)) {
+         case .details:
+@@ -474,6 +549,8 @@ final class CarbEntryViewController: LoopChartsTableViewController, Identifiable
+                 }
+             case .absorptionTime:
+                 break
++            case .mealtimeReminder:
++                break
+             }
+         default:
+             break
+@@ -558,13 +635,15 @@ final class CarbEntryViewController: LoopChartsTableViewController, Identifiable
+             screenWidth: UIScreen.main.bounds.width,
+             originalCarbEntry: originalCarbEntry,
+             potentialCarbEntry: updatedEntry,
+-            selectedCarbAbsorptionTimeEmoji: selectedDefaultAbsorptionTimeEmoji
++            selectedCarbAbsorptionTimeEmoji: selectedDefaultAbsorptionTimeEmoji,
++            isMealtimeReminderEnabled: isMealtimeReminderEnabled
+         )
+         Task {
+             await viewModel.generateRecommendationAndStartObserving()
+         }
+ 
+         viewModel.analyticsServicesManager = deviceManager.analyticsServicesManager
++        
+ 
+         let bolusEntryView = BolusEntryView(viewModel: viewModel).environmentObject(deviceManager.displayGlucoseUnitObservable)
+ 
+@@ -712,6 +791,12 @@ extension CarbEntryViewController: DatePickerTableViewCellDelegate {
+         switch DetailsRow(rawValue: row) {
+         case .date?:
+             date = cell.date
++            
++            hasPendingDateChange = cell.date != originalCarbEntry?.startDate
++            isFutureMeal = cell.date.timeIntervalSinceNow > 15
++            
++            let editingAndEnabled = originalCarbEntry?.startDate != nil && isMealtimeReminderEnabled
++            shouldDisplayMealtimeReminder = (isFutureMeal || editingAndEnabled) && UserDefaults.standard.mealtimeReminderNotificationsEnabled
+         case .absorptionTime?:
+             absorptionTime = cell.duration
+             absorptionTimeWasEdited = true
+diff --git a/Loop/Loop/View Models/BolusEntryViewModel.swift b/Loop/Loop/View Models/BolusEntryViewModel.swift
+index 525eb6ad..c73aa26f 100644
+--- a/Loop/Loop/View Models/BolusEntryViewModel.swift	
++++ b/Loop/Loop/View Models/BolusEntryViewModel.swift	
+@@ -161,6 +161,9 @@ final class BolusEntryViewModel: ObservableObject {
+ 
+     var analyticsServicesManager: AnalyticsServicesManager?
+     
++    var isMealtimeReminderEnabled: Bool?
++    
++    
+     // MARK: - Initialization
+ 
+     init(
+@@ -173,7 +176,8 @@ final class BolusEntryViewModel: ObservableObject {
+         originalCarbEntry: StoredCarbEntry? = nil,
+         potentialCarbEntry: NewCarbEntry? = nil,
+         selectedCarbAbsorptionTimeEmoji: String? = nil,
+-        isManualGlucoseEntryEnabled: Bool = false
++        isManualGlucoseEntryEnabled: Bool = false,
++        isMealtimeReminderEnabled: Bool? = false
+     ) {
+         self.delegate = delegate
+         self.now = now
+@@ -193,6 +197,8 @@ final class BolusEntryViewModel: ObservableObject {
+         
+         self.isManualGlucoseEntryEnabled = isManualGlucoseEntryEnabled
+         
++        self.isMealtimeReminderEnabled = isMealtimeReminderEnabled
++        
+         self.chartDateInterval = DateInterval(start: Date(timeInterval: .hours(-1), since: now()), duration: .hours(7))
+         
+         self.dosingDecision.originalCarbEntry = originalCarbEntry
+@@ -410,6 +416,12 @@ final class BolusEntryViewModel: ObservableObject {
+             if let storedCarbEntry = await saveCarbEntry(carbEntry, replacingEntry: originalCarbEntry) {
+                 self.dosingDecision.carbEntry = storedCarbEntry
+                 self.analyticsServicesManager?.didAddCarbs(source: "Phone", amount: storedCarbEntry.quantity.doubleValue(for: .gram()))
++                
++                if isMealtimeReminderEnabled ?? false {
++                    NotificationManager.handleMealtimeReminderNotificationScheduling(carbEntry: storedCarbEntry)
++                } else {
++                    NotificationManager.removePendingMealtimeReminderNotification(carbEntryIdentifier: storedCarbEntry.syncIdentifier!)
++                }
+             } else {
+                 self.presentAlert(.carbEntryPersistenceFailure)
+                 return false
+diff --git a/Loop/Loop/Views/AlertManagementView.swift b/Loop/Loop/Views/AlertManagementView.swift
+index 856db6da..3b2b5075 100644
+--- a/Loop/Loop/Views/AlertManagementView.swift
++++ b/Loop/Loop/Views/AlertManagementView.swift
+@@ -55,6 +55,15 @@ struct AlertManagementView: View {
+         )
+     }
+ 
++    private var mealtimeReminderNotificationsEnabled: Binding<Bool> {
++        Binding(
++            get: { UserDefaults.standard.mealtimeReminderNotificationsEnabled },
++            set: { enabled in
++                UserDefaults.standard.mealtimeReminderNotificationsEnabled = enabled
++            }
++        )
++    }
++
+     public init(checker: AlertPermissionsChecker, alertMuter: AlertMuter = AlertMuter()) {
+         self.checker = checker
+         self.alertMuter = alertMuter
+@@ -69,6 +78,7 @@ struct AlertManagementView: View {
+             if FeatureFlags.missedMealNotifications {
+                 missedMealAlertSection
+             }
++            mealtimeReminderAlertSection
+         }
+         .navigationTitle(NSLocalizedString("Alert Management", comment: "Title of alert management screen"))
+     }
+@@ -173,11 +183,18 @@ struct AlertManagementView: View {
+             Toggle(NSLocalizedString("Missed Meal Notifications", comment: "Title for missed meal notifications toggle"), isOn: missedMealNotificationsEnabled)
+         }
+     }
++    
++    private var mealtimeReminderAlertSection: some View {
++        Section(footer: DescriptiveText(label: NSLocalizedString("When activated, Loop can remind you of a meal you've pre-bolused for and it's time to eat. You can manually activate a mealtime reminder for each carbohydrate entry dated in the future (15min and more).", comment: "Description of mealtime reminder notifications."))) {
++            Toggle(NSLocalizedString("Mealtime Reminder Notifications", comment: "Title for mealtime reminder notifications toggle"), isOn: mealtimeReminderNotificationsEnabled)
++        }
++    }
+ }
+ 
+ extension UserDefaults {
+     private enum Key: String {
+         case missedMealNotificationsEnabled = "com.loopkit.Loop.MissedMealNotificationsEnabled"
++        case mealtimeReminderNotificationsEnabled = "com.loopkit.Loop.MealtimeReminderNotificationsEnabled"
+     }
+     
+     var missedMealNotificationsEnabled: Bool {
+@@ -188,6 +205,15 @@ extension UserDefaults {
+             set(newValue, forKey: Key.missedMealNotificationsEnabled.rawValue)
+         }
+     }
++    
++    var mealtimeReminderNotificationsEnabled: Bool {
++        get {
++            return object(forKey: Key.mealtimeReminderNotificationsEnabled.rawValue) as? Bool ?? false
++        }
++        set {
++            set(newValue, forKey: Key.mealtimeReminderNotificationsEnabled.rawValue)
++        }
++    }
+ }
+ 
+ struct AlertManagementView_Previews: PreviewProvider {
+Submodule LoopKit contains modified content
+diff --git a/LoopKit/LoopKit/Notification/LoopNotificationCategory.swift b/LoopKit/LoopKit/Notification/LoopNotificationCategory.swift
+index d4979d6..98dfc58 100644
+--- a/LoopKit/LoopKit/Notification/LoopNotificationCategory.swift
++++ b/LoopKit/LoopKit/Notification/LoopNotificationCategory.swift
+@@ -24,4 +24,5 @@ public enum LoopNotificationCategory: String {
+     case remoteCarbs
+     case remoteCarbsFailure
+     case missedMeal
++    case mealtimeReminder
+ }
+diff --git a/LoopKit/LoopKit/Notification/LoopNotificationUserInfoKey.swift b/LoopKit/LoopKit/Notification/LoopNotificationUserInfoKey.swift
+index 3e83d25..3b016a5 100644
+--- a/LoopKit/LoopKit/Notification/LoopNotificationUserInfoKey.swift
++++ b/LoopKit/LoopKit/Notification/LoopNotificationUserInfoKey.swift
+@@ -15,4 +15,5 @@ public enum LoopNotificationUserInfoKey: String {
+     case missedMealTime
+     case missedMealCarbAmount
+     case expirationDate
++    case carbEntryIdentifier
+ }
